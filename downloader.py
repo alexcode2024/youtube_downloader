@@ -109,7 +109,10 @@ def build_format_string(quality, audio_only, has_ffmpeg=True):
       - 视频：best[ext=mp4]/best 等，避免触发「需要合并」的错误
     """
     if audio_only:
-        return "bestaudio/best"
+        # 明确选纯音频流：[acodec!=none] 约束避免兜底到含视频的混合流。
+        # 不加约束时，某些视频在签名失效场景下 bestaudio 会错误选中视频流，
+        # 导致「从视频提取音频」（慢 + 易 403）。
+        return "bestaudio[acodec!=none]/bestaudio/best"
 
     if not has_ffmpeg:
         # 无 ffmpeg：只能下单一文件流，不能合并 video+audio
@@ -235,7 +238,9 @@ class DownloadWorker(QThread):
         self._current_file_idx = 0  # 当前下载的是第几个文件（0-based）
         self._total_streams = 1     # 将要下载的流数（video+audio=2，单流=1），
                                     # 由 extract_info 的 requested_formats 确定
-        self._stream_kinds = []     # 每个流的类型（'video'/'audio'），与流顺序对应
+        # 预设流类型：音频模式按单音频流，视频模式按单视频流兜底；
+        # extract_info 成功后会被 requested_formats 的真实类型覆盖。
+        self._stream_kinds = ["audio"] if audio_only else ["video"]
 
     def _progress_hook(self, d):
         """yt-dlp progress_hooks 回调：在下载线程内被调用。
@@ -287,8 +292,11 @@ class DownloadWorker(QThread):
             self.progress.emit(overall_pct, size_text, speed_text, eta_text)
 
         elif status == "finished":
-            # 单个文件片段下载完成（合并前），记下文件路径
-            self._final_filepath = d.get("filename")
+            # 单个文件片段下载完成（合并前），记下文件路径。
+            # 注意：MP3 模式下这里的 filename 是下载的 .m4a/.webm（转码前），
+            # 不能覆盖最终路径（_final_filepath 应指向 .mp3），所以音频模式跳过。
+            if not self.audio_only:
+                self._final_filepath = d.get("filename")
 
     def _postprocessor_hook(self, d):
         """yt-dlp postprocessor_hooks 回调：捕获合并/提取音频等后处理阶段。
@@ -300,11 +308,15 @@ class DownloadWorker(QThread):
         if status != "started":
             return
         pp_name = (d.get("postprocessor") or "").lower()
-        if "merge" in pp_name or "ffmpeg" in pp_name:
+        if "merge" in pp_name or "ffmpegvideo" in pp_name:
+            # 视频模式：合并 video+audio 流
             self.stage.emit("正在合并视频和音频")
             self.progress.emit(99, "", "", "")  # 合并阶段进度固定在 99%
-        elif "extractaudio" in pp_name or "audio" in pp_name:
-            self.stage.emit("正在提取音频")
+        elif "extractaudio" in pp_name:
+            # 这一步是「转码为 MP3」（m4a/webm → mp3），不是「提取」。
+            # 音频流在下载阶段就已经下好了，这里是格式转换。
+            self.stage.emit("正在转换为 MP3")
+            self.progress.emit(99, "", "", "")
         elif "embed" in pp_name:
             self.stage.emit("正在写入元数据")
 
@@ -407,11 +419,13 @@ class DownloadWorker(QThread):
             ydl_opts.update({
                 "extractaudio": True,
                 "audio_format": "mp3",
-                "audio_quality": "0",  # 最高质量
+                # preferredquality 用 192（MP3 优质标准）而非 0：
+                # 0 表示「按源码率」，高码率源（如 388kbps m4a）会触发 ffmpeg
+                # 重型重编码且文件臃肿；192kbps 听感无损、转码快、体积小。
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": "0",
+                    "preferredquality": "192",
                 }],
             })
         else:
@@ -457,6 +471,9 @@ class DownloadWorker(QThread):
                                             self._stream_kinds.append("audio")
                                         else:
                                             self._stream_kinds.append("")
+                                elif self.audio_only:
+                                    # 音频提取模式 requested_formats 为空，按单音频流处理
+                                    self._stream_kinds = ["audio"]
                                 try:
                                     self._final_filepath = ydl.prepare_filename(info)
                                     if self.audio_only:
