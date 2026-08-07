@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 下载的视频/音频输出
+outputs/
+
+# 运行时生成的日志/临时文件
+YouTubeDownloader_crash.log
+YouTubeDownloader_diag.txt
+*_out.txt
+*_diag*.py
+_test_*.py
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

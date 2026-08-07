@@ -1,0 +1,10 @@
+# GUI 程序运行依赖
+PyQt6>=6.5
+yt-dlp>=2024.0
+# curl_cffi：提供浏览器 TLS 指纹，缓解 YouTube 的 SSL 限流
+# (UNEXPECTED_EOF_WHILE_READING)。注意：yt-dlp 仅支持 0.10.x~0.15.x，
+# 0.16+ 不被识别。版本必须受限。
+curl_cffi>=0.10,<0.16
+
+# 打包工具（运行 build_exe.bat 时需要）
+pyinstaller>=6.0
