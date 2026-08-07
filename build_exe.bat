@@ -17,6 +17,8 @@ echo.
 
 pyinstaller --noconfirm --onefile --windowed ^
   --name "YouTubeDownloader" ^
+  --icon "app.ico" ^
+  --add-data "app.ico;." ^
   --collect-all yt_dlp ^
   --exclude PySide6 ^
   --exclude PySide6_Essentials ^

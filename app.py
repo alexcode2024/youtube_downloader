@@ -14,12 +14,12 @@ import traceback
 from datetime import datetime
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QProgressBar,
     QRadioButton, QButtonGroup, QFileDialog, QMessageBox, QFrame,
 )
-from PyQt6.QtGui import QFont
 
 from downloader import DownloadWorker, ProbeWorker
 
@@ -27,6 +27,17 @@ from downloader import DownloadWorker, ProbeWorker
 # best 选项固定显示在最前，之后追加检测到的真实分辨率
 BEST_LABEL = "best (最高画质)"
 FORMAT_OPTIONS = ["mp4", "webm", "mkv"]
+
+
+def _resource_path(relative_name):
+    """获取资源文件的绝对路径，兼容「源码运行」和「PyInstaller 打包后运行」。
+
+    源码运行：资源在脚本同目录（如 app.ico 与 app.py 同级）。
+    打包后：PyInstaller 解压到临时目录 sys._MEIPASS，资源在那里。
+    用 --add-data 把资源打进 exe 后，必须用此函数定位。
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_name)
 
 
 def _bootstrap_stdio():
@@ -107,6 +118,11 @@ class DownloaderWindow(QWidget):
         self.setMinimumWidth(600)
         self.setMinimumHeight(480)
         self.resize(640, 520)  # 启动时给足空间，避免内容拥挤
+
+        # 窗口图标（任务栏、标题栏都会显示）
+        icon_path = _resource_path("app.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
