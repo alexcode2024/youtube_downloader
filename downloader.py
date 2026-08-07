@@ -535,39 +535,98 @@ class DownloadWorker(QThread):
 
 def _extract_resolutions(info):
     """
-    从 yt-dlp 的 info 字典中解析出真实可用的视频分辨率列表。
+    从 yt-dlp 的 info 字典中解析出真实可用的视频分辨率列表，并估算每档
+    分辨率的下载体积。
 
-    返回降序、去重的字符串列表，例如 ['2160p', '1080p', '720p', '480p']。
-    若无法解析则返回空列表。
+    返回降序的元组列表 [(分辨率字符串, 体积字节数), ...]，例如：
+        [('2160p', 1370000000), ('1080p', 286000000), ('720p', 168000000)]
+    若某档体积无法估算则为 0。无法解析任何分辨率时返回空列表。
+
+    体积估算逻辑（与 yt-dlp 实际下载的选流一致）：
+      - 视频流：在 height<=该分辨率的纯视频流中，选 vbr 最高的一档
+      - 音频流：取所有纯音频流中 abr 最高的一档
+      - 两者 filesize/filesize_approx 之和为该分辨率估算体积
     """
     if not info:
         return []
     formats = info.get("formats") or []
-    heights = set()
 
-    def _consider(fmt):
-        # 只要带正整数高度的流都纳入候选（视频或视频+音频的混合流都算）
-        h = fmt.get("height")
-        if isinstance(h, int) and h > 0:
-            heights.add(h)
+    def _fmt_size(fmt):
+        """取格式体积，优先 filesize，其次 filesize_approx。"""
+        s = fmt.get("filesize")
+        if s is None:
+            s = fmt.get("filesize_approx")
+        if isinstance(s, (int, float)) and s > 0:
+            return int(s)
+        return 0
 
-    # 优先：仅视频流（vcodec 有效、acodec 为 none）
-    for fmt in formats:
-        if fmt.get("vcodec") and fmt.get("vcodec") != "none" and fmt.get("acodec") == "none":
-            _consider(fmt)
+    def _vbr(fmt):
+        v = fmt.get("vbr")
+        return v if isinstance(v, (int, float)) else 0
+
+    def _abr(fmt):
+        a = fmt.get("abr")
+        return a if isinstance(a, (int, float)) else 0
+
+    def _vcodec_priority(fmt):
+        """视频编码优先级，模拟 yt-dlp 的默认视频流偏好：
+        av01（新一代，体积小质量好）> vp9 > vp09 > avc1/h264。
+        yt-dlp 实际倾向选 av01 流（同分辨率下体积最小），而非 vbr 最高的流。
+        返回数值越大优先级越高。"""
+        vc = (fmt.get("vcodec") or "").lower()
+        if vc.startswith("av01"):
+            return 4
+        if vc.startswith("vp09"):
+            return 3
+        if vc.startswith("vp9"):
+            return 2
+        if vc.startswith("avc1") or vc.startswith("h264"):
+            return 1
+        return 0
+
+    # 纯视频流（vcodec 有效、acodec 为 none）
+    video_streams = [f for f in formats
+                     if (f.get("vcodec") or "none") != "none"
+                     and (f.get("acodec") or "none") == "none"
+                     and isinstance(f.get("height"), int) and f["height"] > 0]
+    # 纯音频流（acodec 有效、vcodec 为 none）
+    audio_streams = [f for f in formats
+                     if (f.get("acodec") or "none") != "none"
+                     and (f.get("vcodec") or "none") == "none"]
+
+    # 最优音频流体积（所有分辨率共用同一档音频）
+    best_audio_size = 0
+    if audio_streams:
+        best_audio = max(audio_streams, key=_abr)
+        best_audio_size = _fmt_size(best_audio)
 
     # 兜底：没有独立视频流时，退化为任意带 height 的流
-    if not heights:
-        for fmt in formats:
-            _consider(fmt)
+    use_streams = video_streams if video_streams else [
+        f for f in formats if isinstance(f.get("height"), int) and f["height"] > 0
+    ]
 
-    # 再兜底：info 顶层自身就带 height（单格式场景）
-    if not heights:
+    if not use_streams:
+        # 再兜底：info 顶层自身就带 height（单格式场景）
         top_h = info.get("height")
         if isinstance(top_h, int) and top_h > 0:
-            heights.add(top_h)
+            return [(f"{top_h}p", 0)]
+        return []
 
-    return [f"{h}p" for h in sorted(heights, reverse=True)]
+    heights = sorted({f["height"] for f in use_streams}, reverse=True)
+    result = []
+    for h in heights:
+        # bestvideo[height<=h]：模拟 yt-dlp 选流。
+        # yt-dlp 默认偏好 av01 等新编码（体积小质量好），而非 vbr 最高，
+        # 所以按 (vcodec优先级, vbr) 联合排序选最优一档。
+        candidates = [f for f in use_streams if f["height"] <= h]
+        if not candidates:
+            result.append((f"{h}p", 0))
+            continue
+        best_video = max(candidates, key=lambda f: (_vcodec_priority(f), _vbr(f)))
+        total = _fmt_size(best_video) + best_audio_size
+        result.append((f"{h}p", total))
+
+    return result
 
 
 class ProbeWorker(QThread):
@@ -577,7 +636,8 @@ class ProbeWorker(QThread):
 
     信号：
       info_ready(str)  —— 视频标题
-      probed(list)     —— 可用分辨率字符串列表（降序，如 ['1080p','720p']）
+      probed(list)     —— [(分辨率字符串, 体积字节), ...]（降序，
+                          如 [('1080p', 286000000), ('720p', 168000000)]）
       failed(str)      —— 失败信息
     """
 

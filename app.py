@@ -29,6 +29,24 @@ BEST_LABEL = "best (最高画质)"
 FORMAT_OPTIONS = ["mp4", "webm", "mkv"]
 
 
+def _fmt_size(num_bytes):
+    """把字节数转成人类可读的 KB/MB/GB，用于画质体积显示。"""
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return "?"
+    if n <= 0:
+        return "未知大小"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0:
+            # 小于 1MB 显示整数 KB，否则一位小数
+            if unit == "KB":
+                return f"{int(n)} KB"
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
+
 def _resource_path(relative_name):
     """获取资源文件的绝对路径，兼容「源码运行」和「PyInstaller 打包后运行」。
 
@@ -343,11 +361,17 @@ class DownloaderWindow(QWidget):
         self.status_label.setText(f"已找到: {title}")
 
     def _on_probed(self, resolutions):
-        """检测成功：填充画质下拉框（best 在前），默认选 best。"""
+        """检测成功：填充画质下拉框（best 在前），默认选 best。
+
+        resolutions 是 [(分辨率字符串, 体积字节), ...]。
+        显示文本带体积如「1080p (273 MB)」；itemData 存纯分辨率字符串
+        （如「1080p」），供下载时取用，不受显示文本影响。
+        """
         self.quality_combo.clear()
-        self.quality_combo.addItem(BEST_LABEL)
-        for res in resolutions:
-            self.quality_combo.addItem(res)
+        self.quality_combo.addItem(BEST_LABEL, userData="best")
+        for res_name, size_bytes in resolutions:
+            display = f"{res_name} ({_fmt_size(size_bytes)})"
+            self.quality_combo.addItem(display, userData=res_name)
         self.quality_combo.setCurrentIndex(0)
         self.stats_label.setText(
             f"检测到 {len(resolutions)} 种分辨率，请选择画质。"
@@ -407,9 +431,9 @@ class DownloaderWindow(QWidget):
                 QMessageBox.critical(self, "错误", f"无法创建目录：\n{e}")
                 return
 
-        # 画质取值：best 选项映射回 "best"，其余直接用分辨率字符串（如 "720p"）
-        quality_text = self.quality_combo.currentText()
-        quality = "best" if quality_text == BEST_LABEL else quality_text
+        # 画质取值：从 itemData 取纯分辨率（如 "best"/"1080p"），
+        # 不受下拉框显示文本（带体积）影响。
+        quality = self.quality_combo.currentData() or "best"
         video_format = self.format_combo.currentText()
 
         # ---- 启动下载 ----
