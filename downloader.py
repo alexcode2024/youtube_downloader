@@ -61,6 +61,50 @@ def normalize_youtube_url(url):
 
 
 
+# YouTube 字幕语言代码 → 友好名称的映射（常见语言）。
+# 未列出的语言代码原样显示（如 'af' 显示 'af'）。
+_SUBTITLE_LANG_NAMES = {
+    "zh-Hans": "简体中文", "zh-Hant": "繁体中文", "zh": "中文",
+    "zh-CN": "简体中文", "zh-TW": "繁体中文",
+    "en": "英语", "en-US": "英语(美)", "en-GB": "英语(英)",
+    "ja": "日语", "ko": "韩语",
+    "fr": "法语", "de": "德语", "es": "西班牙语", "it": "意大利语",
+    "pt": "葡萄牙语", "pt-BR": "葡萄牙语(巴)", "ru": "俄语",
+    "ar": "阿拉伯语", "hi": "印地语", "th": "泰语", "vi": "越南语",
+    "id": "印尼语", "ms": "马来语", "tr": "土耳其语", "nl": "荷兰语",
+    "pl": "波兰语", "uk": "乌克兰语",
+}
+
+
+def subtitle_display_name(lang_code):
+    """把语言代码转成友好显示名，如 'zh-Hans' → '简体中文'。"""
+    return _SUBTITLE_LANG_NAMES.get(lang_code, lang_code)
+
+
+def extract_subtitle_languages(info):
+    """
+    从 yt-dlp 的 info 字典中提取可用字幕语言代码列表。
+
+    优先人工字幕（subtitles，准确度高），再补自动字幕（automatic_captions）。
+    返回语言代码列表（如 ['zh-Hans', 'en', 'ja']），无字幕时返回空列表。
+    两种来源的语言去重（同一语言有人工字幕就不重复列自动字幕）。
+    """
+    if not info:
+        return []
+    manual = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+    # 人工字幕优先
+    langs = list(manual.keys())
+    # 补充自动字幕里人工没有的语言
+    for lang in auto.keys():
+        if lang not in manual:
+            langs.append(lang)
+    # 常见语言优先排序：中英日韩在前，其余按字母序
+    priority = ["zh-Hans", "zh-Hant", "zh", "en", "ja", "ko"]
+    langs.sort(key=lambda x: (0 if x in priority else 1, priority.index(x) if x in priority else 99, x))
+    return langs
+
+
 def ffmpeg_available():
     """检测系统是否可用 ffmpeg（yt-dlp 合并流 / 提取音频需要它）。"""
     import shutil
@@ -206,14 +250,14 @@ def _setup_thread_stdio():
 
 class DownloadWorker(QThread):
     """
-    后台下载线程。
+    后台下载线程，支持单/多 URL 队列。
 
     信号：
-      info_ready(str)   —— 拿到视频标题后发出，用于在 UI 显示
-      stage(str)        —— 当前阶段提示（如「正在下载视频流」「正在合并」）
+      info_ready(str)   —— 单个视频标题（或队列进度提示）
+      stage(str)        —— 当前阶段提示（如「[2/5] 正在下载视频流」）
       progress(int, str, str, str) —— (百分比0-100, 已下载/总量文本, 速度文本, ETA文本)
-      finished_ok(str)  —— 下载成功，附带最终文件路径
-      failed(str)       —— 下载失败，附带错误信息
+      finished_ok(str)  —— 全部成功，附带最终文件路径
+      failed(str)       —— 失败信息（全部失败或部分失败汇总）
     """
 
     info_ready = pyqtSignal(str)
@@ -222,42 +266,36 @@ class DownloadWorker(QThread):
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, url, output_dir, quality, video_format, audio_only, parent=None):
+    def __init__(self, urls, output_dir, quality, video_format, audio_only,
+                 subtitle_lang=None, parent=None):
         super().__init__(parent)
-        self.url = url
+        # urls：URL 列表（支持批量）；单视频时长度为 1
+        self.urls = list(urls) if urls else []
         self.output_dir = output_dir
         self.quality = quality
         self.video_format = video_format
         self.audio_only = audio_only
-        self._ydl = None  # yt-dlp 实例引用
+        self.subtitle_lang = subtitle_lang  # 字幕语言代码，None=不下字幕
+        self._ydl = None
         self._final_filepath = None
-        self._cancelled = False  # 取消标志（progress_hook 检查它来快速中断）
-        # 多流进度跟踪：合并格式会分别下载 video + audio，每个流各自触发
-        # 0→100%，需归一化为整体进度，避免「到100又从0开始」。
-        self._seen_files = []      # 已出现的下载文件名（按顺序）
-        self._current_file_idx = 0  # 当前下载的是第几个文件（0-based）
-        self._total_streams = 1     # 将要下载的流数（video+audio=2，单流=1），
-                                    # 由 extract_info 的 requested_formats 确定
-        # 预设流类型：音频模式按单音频流，视频模式按单视频流兜底；
-        # extract_info 成功后会被 requested_formats 的真实类型覆盖。
+        self._cancelled = False
+        # 多流进度跟踪
+        self._seen_files = []
+        self._current_file_idx = 0
+        self._total_streams = 1
         self._stream_kinds = ["audio"] if audio_only else ["video"]
+        self._base_opts = None  # 缓存基础 ydl_opts
 
     def _progress_hook(self, d):
-        """yt-dlp progress_hooks 回调：在下载线程内被调用。
-        yt-dlp 在每个数据块下载后都会调用它，是「快速取消」的最佳钩子点：
-        检查到取消标志时抛异常，可在几百毫秒内中断下载（而不必等整个
-        download() 阻塞调用返回）。"""
         if self._cancelled:
             raise _DownloadCancelled()
         status = d.get("status")
         filename = d.get("filename", "")
 
         if status == "downloading":
-            # 跟踪当前文件索引（首次见到该 filename 时登记）
             if filename and filename not in self._seen_files:
                 self._seen_files.append(filename)
                 self._current_file_idx = len(self._seen_files) - 1
-                # 切换到新流时，提示阶段（视频流/音频流）
                 kind = (self._stream_kinds[self._current_file_idx]
                         if self._current_file_idx < len(self._stream_kinds)
                         else "")
@@ -271,16 +309,10 @@ class DownloadWorker(QThread):
             speed = d.get("speed") or 0
             eta = d.get("eta")
 
-            # 单文件进度
             file_pct = (int(downloaded * 100 / total) if total > 0 else 0)
-
-            # 归一化为整体进度：把每个流平均分配进度区间。
-            # 例如 2 个流（video+audio）：流1 占 0-50%，流2 占 50-100%。
-            # _total_streams 由 extract_info 的 requested_formats 确定，
-            # 确保 video 流下载时就按正确的总流数归一化，不会到 100% 再回 0。
             total_streams = max(self._total_streams, 1)
             overall_pct = int((self._current_file_idx + file_pct / 100) / total_streams * 100)
-            overall_pct = min(overall_pct, 99)  # 不让进度在下载阶段就显示 100%（留给完成）
+            overall_pct = min(overall_pct, 99)
 
             if total > 0:
                 size_text = f"{human_size(downloaded)} / {human_size(total)}"
@@ -292,16 +324,11 @@ class DownloadWorker(QThread):
             self.progress.emit(overall_pct, size_text, speed_text, eta_text)
 
         elif status == "finished":
-            # 单个文件片段下载完成（合并前），记下文件路径。
-            # 注意：MP3 模式下这里的 filename 是下载的 .m4a/.webm（转码前），
-            # 不能覆盖最终路径（_final_filepath 应指向 .mp3），所以音频模式跳过。
+            # MP3 模式下 filename 是转码前的 .m4a，不能覆盖最终路径
             if not self.audio_only:
                 self._final_filepath = d.get("filename")
 
     def _postprocessor_hook(self, d):
-        """yt-dlp postprocessor_hooks 回调：捕获合并/提取音频等后处理阶段。
-        下载完所有流后，yt-dlp 会调 ffmpeg 合并或提取，这是较耗时的阶段，
-        需要给用户明确提示（否则进度卡在 99% 让人以为卡住了）。"""
         if self._cancelled:
             return
         status = d.get("status")
@@ -309,33 +336,23 @@ class DownloadWorker(QThread):
             return
         pp_name = (d.get("postprocessor") or "").lower()
         if "merge" in pp_name or "ffmpegvideo" in pp_name:
-            # 视频模式：合并 video+audio 流
             self.stage.emit("正在合并视频和音频")
-            self.progress.emit(99, "", "", "")  # 合并阶段进度固定在 99%
+            self.progress.emit(99, "", "", "")
         elif "extractaudio" in pp_name:
-            # 这一步是「转码为 MP3」（m4a/webm → mp3），不是「提取」。
-            # 音频流在下载阶段就已经下好了，这里是格式转换。
             self.stage.emit("正在转换为 MP3")
             self.progress.emit(99, "", "", "")
         elif "embed" in pp_name:
             self.stage.emit("正在写入元数据")
 
     def cancel(self):
-        """请求取消下载。在 GUI 线程中调用。
-        设置 _cancelled 标志后，下一次 progress_hook 回调（几百毫秒内）
-        会抛 _DownloadCancelled 异常，快速中断 yt-dlp 的下载循环。"""
         self._cancelled = True
         self.requestInterruption()
 
     def run(self):
-        """线程主函数：执行 yt-dlp。整个函数体包在兜底 try 中，
-        保证线程内任何异常都通过 failed 信号反馈给 GUI（弹框），
-        而不是静默崩溃导致界面「闪退」。"""
-        _setup_thread_stdio()  # 修复 QThread 内子进程死锁
+        _setup_thread_stdio()
         try:
             self._run_inner()
         except Exception as e:
-            # 记录到崩溃日志，便于排查
             try:
                 import os, traceback as _tb
                 from datetime import datetime
@@ -350,67 +367,52 @@ class DownloadWorker(QThread):
             self.failed.emit(f"发生错误: {e}")
 
     def _run_inner(self):
-        # 延迟导入，避免打包/启动阶段强依赖 yt-dlp
         try:
             import yt_dlp
         except ImportError:
             self.failed.emit("未找到 yt-dlp，请先运行: pip install yt-dlp")
             return
 
-        # 规范化 URL：去掉 list=/start_radio= 等播放列表参数，
-        # 避免 yt-dlp 拉取整个播放列表触发 SSL 限流/403。
-        url = normalize_youtube_url(self.url)
+        if not self.urls:
+            self.failed.emit("没有可下载的链接。")
+            return
 
-        # 检测 ffmpeg：合并 video+audio 流、提取 MP3 都需要它。
-        # 无 ffmpeg 时降级到单流格式（视频）或直接报错（MP3）。
         has_ffmpeg = ffmpeg_available()
         if self.audio_only and not has_ffmpeg:
             self.failed.emit(
                 "下载 MP3 需要 ffmpeg，但系统未检测到 ffmpeg。\n\n"
-                "请安装 ffmpeg 并确保它在系统 PATH 中，或手动指定路径。\n"
+                "请安装 ffmpeg 并确保它在系统 PATH 中。\n"
                 "下载地址：https://ffmpeg.org/download.html"
             )
             return
 
         format_string = build_format_string(self.quality, self.audio_only, has_ffmpeg)
-
-        # 降级提示：无 ffmpeg 时视频画质可能受限
         if not has_ffmpeg and not self.audio_only:
             self.info_ready.emit("（未检测到 ffmpeg，已降级为单流下载，画质可能略低）")
 
-        # 规范化保存目录：把正斜杠转成 Windows 原生反斜杠，
-        # 避免混用斜杠 + 中文路径触发 OSError [Errno 22] Invalid argument。
-        # 同时展开 ~ 等，确保目录存在。
         try:
             output_dir = os.path.normpath(os.path.expanduser(self.output_dir))
         except Exception:
             output_dir = self.output_dir
 
-        # 输出模板：标题截断到 80 字符，避免 Windows 路径超长。
-        # 目录与模板名之间用 os.path.join 保证用平台正确的分隔符。
         outtmpl = os.path.join(output_dir, "%(title).80s.%(ext)s")
 
-        # 自定义 logger 在每次重试循环里单独创建（见下方 attempt_logger），
-        # 这里只定义基础 opts。
         ydl_opts = {
             "format": format_string,
             "outtmpl": outtmpl,
             "no_playlist": True,
             "progress_hooks": [self._progress_hook],
             "postprocessor_hooks": [self._postprocessor_hook],
-            "noprogress": True,   # 不让 yt-dlp 直接打印进度（进度经 progress_hooks 拿）
-            "quiet": True,        # 静默：避免向 stdout 打印（windowed 打包下无控制台）
-            "no_warnings": False,  # 保留警告，由 logger 捕获
-            # 网络容错：YouTube 限流/SSL 中断时自动重试，缓解
-            # UNEXPECTED_EOF_WHILE_READING 等偶发网络错误
-            "retries": 10,              # 下载重试次数
-            "fragment_retries": 10,     # 分片下载重试次数
-            "extractor_retries": 3,     # 提取阶段重试次数
-            "socket_timeout": 30,       # 单次请求超时（秒）
+            "noprogress": True,
+            "quiet": True,
+            "no_warnings": False,
+            "retries": 10,
+            "fragment_retries": 10,
+            "extractor_retries": 3,
+            "socket_timeout": 30,
             "ignoreerrors": False,
         }
 
-        # 启用 JS runtime（node/deno）：解析 YouTube 签名必需，否则易 403
         js_runtimes = detect_js_runtimes()
         if js_runtimes:
             ydl_opts["js_runtimes"] = js_runtimes
@@ -419,9 +421,6 @@ class DownloadWorker(QThread):
             ydl_opts.update({
                 "extractaudio": True,
                 "audio_format": "mp3",
-                # preferredquality 用 192（MP3 优质标准）而非 0：
-                # 0 表示「按源码率」，高码率源（如 388kbps m4a）会触发 ffmpeg
-                # 重型重编码且文件臃肿；192kbps 听感无损、转码快、体积小。
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
@@ -430,37 +429,77 @@ class DownloadWorker(QThread):
             })
         else:
             ydl_opts["merge_output_format"] = self.video_format
+            # 字幕：仅视频模式且指定语言时下载并嵌入（嵌入需 ffmpeg）
+            if self.subtitle_lang and has_ffmpeg:
+                ydl_opts.update({
+                    "writesubtitles": True,
+                    "writeautomaticsub": True,
+                    "subtitleslangs": [self.subtitle_lang],
+                    "postprocessors": list(ydl_opts.get("postprocessors", [])) + [{"key": "EmbedSubtitle"}],
+                })
 
-        # 外层重试：YouTube 会对可疑连接做 TLS 限流（SSL: UNEXPECTED_EOF），
-        # 这是概率性的。yt-dlp 内部的 retries 只在分片级重试，某些 SSL 失败
-        # 会让整个下载 abort。这里在 SSL/网络错误时整体重新发起下载。
+        self._base_opts = ydl_opts
+
+        # 队列遍历：依次下载每个 URL，单个失败不中断，最后汇总
+        total = len(self.urls)
+        ok_count = 0
+        failures = []
+        for idx, raw_url in enumerate(self.urls, start=1):
+            if self._cancelled or self.isInterruptionRequested():
+                break
+            url = normalize_youtube_url(raw_url)
+            prefix = f"[{idx}/{total}] " if total > 1 else ""
+            success, err = self._download_one(yt_dlp, url, prefix)
+            if success:
+                ok_count += 1
+            else:
+                if self._cancelled or self.isInterruptionRequested():
+                    break
+                failures.append((raw_url, err))
+
+        # 汇总结果
+        if self._cancelled or self.isInterruptionRequested():
+            self.failed.emit("已取消下载" + (f"（已完成 {ok_count}/{total}）" if ok_count else ""))
+            return
+        if ok_count == total:
+            self.finished_ok.emit(self._final_filepath or self.output_dir)
+        elif ok_count == 0:
+            self.failed.emit(f"全部下载失败（共 {total} 个）：\n" + "\n".join(f"- {u}: {e[:80]}" for u, e in failures))
+        else:
+            detail = "\n".join(f"- {u}: {e[:80]}" for u, e in failures)
+            self.failed.emit(f"部分完成 {ok_count}/{total}，失败 {len(failures)} 个：\n{detail}")
+
+    def _download_one(self, yt_dlp, url, prefix):
+        """下载单个 URL（含外层重试）。返回 (是否成功, 错误信息)。
+        prefix 是队列前缀（如 '[2/5] '），用于 stage/info 提示。"""
         MAX_ATTEMPTS = 5
         last_err = ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             if self._cancelled or self.isInterruptionRequested():
-                self.failed.emit("已取消下载")
-                return
+                return False, "已取消"
 
-            # 每次重试用新实例 + 新 logger，避免内部状态/错误累积污染
             attempt_logger = _YDLLogger()
-            attempt_opts = dict(ydl_opts)
+            attempt_opts = dict(self._base_opts)
             attempt_opts["logger"] = attempt_logger
+
+            # 重置单视频流跟踪状态
+            self._seen_files = []
+            self._current_file_idx = 0
+            self._total_streams = 1
+            self._stream_kinds = ["audio"] if self.audio_only else ["video"]
 
             try:
                 with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                     self._ydl = ydl
-                    # 先取信息（标题等），让 UI 尽早显示（仅首次）
                     if attempt == 1:
                         try:
                             info = ydl.extract_info(url, download=False)
                             if info:
                                 title = info.get("title") or "未知标题"
-                                self.info_ready.emit(title)
-                                # 确定将下载的流数（video+audio 分开则是 2）
+                                self.info_ready.emit(f"{prefix}{title}")
                                 req_formats = info.get("requested_formats") or []
                                 if req_formats:
                                     self._total_streams = len(req_formats)
-                                    # 记录每个流的类型，用于下载时提示「视频流/音频流」
                                     self._stream_kinds = []
                                     for fmt in req_formats:
                                         vcodec = (fmt.get("vcodec") or "none").lower()
@@ -472,7 +511,6 @@ class DownloadWorker(QThread):
                                         else:
                                             self._stream_kinds.append("")
                                 elif self.audio_only:
-                                    # 音频提取模式 requested_formats 为空，按单音频流处理
                                     self._stream_kinds = ["audio"]
                                 try:
                                     self._final_filepath = ydl.prepare_filename(info)
@@ -485,54 +523,36 @@ class DownloadWorker(QThread):
                             pass
 
                     if self._cancelled or self.isInterruptionRequested():
-                        self.failed.emit("已取消下载")
-                        return
+                        return False, "已取消"
 
-                    # download 返回错误码：0=成功，非0=有错误（即使没抛异常）
                     retcode = ydl.download([url])
 
                 if self._cancelled or self.isInterruptionRequested():
-                    self.failed.emit("已取消下载")
-                    return
+                    return False, "已取消"
 
-                # 成功判定：retcode==0 且无 error
                 if retcode == 0 and not attempt_logger.errors:
-                    self.finished_ok.emit(self._final_filepath or self.output_dir)
-                    return
+                    return True, ""
 
-                # 失败：收集错误信息，判断是否值得重试（网络/SSL 类错误）
                 last_err = "\n".join(attempt_logger.errors) if attempt_logger.errors else f"错误码 {retcode}"
 
             except _DownloadCancelled:
-                # 用户取消：立即停止，不重试
-                self.failed.emit("已取消下载")
-                return
+                return False, "已取消"
             except Exception as e:
-                # 用户取消（其他路径触发）也立即停止
                 if self._cancelled:
-                    self.failed.emit("已取消下载")
-                    return
+                    return False, "已取消"
                 last_err = str(e)
                 retcode = 1
-                # 重新拿 logger 错误
                 extra = "\n".join(attempt_logger.errors) if attempt_logger.errors else ""
                 if extra:
                     last_err = f"{e}\n{extra}"
 
-            # 用户取消则不再重试
             if self._cancelled or self.isInterruptionRequested():
-                self.failed.emit("已取消下载")
-                return
+                return False, "已取消"
 
-            # 还有机会则提示重试
             if attempt < MAX_ATTEMPTS:
-                self.info_ready.emit(f"网络异常，正在重试（第 {attempt + 1}/{MAX_ATTEMPTS} 次）…")
+                self.info_ready.emit(f"{prefix}网络异常，正在重试（第 {attempt + 1}/{MAX_ATTEMPTS} 次）…")
 
-        # 全部重试用尽
-        self.failed.emit(f"下载失败（已重试 {MAX_ATTEMPTS} 次）：\n{last_err}")
-
-
-
+        return False, f"重试 {MAX_ATTEMPTS} 次仍失败：{last_err[:120]}"
 def _extract_resolutions(info):
     """
     从 yt-dlp 的 info 字典中解析出真实可用的视频分辨率列表，并估算每档
@@ -643,6 +663,7 @@ class ProbeWorker(QThread):
 
     info_ready = pyqtSignal(str)
     probed = pyqtSignal(list)
+    subs_ready = pyqtSignal(list)   # 可用字幕语言代码列表，无字幕时为空
     failed = pyqtSignal(str)
 
     def __init__(self, url, parent=None):
@@ -699,6 +720,10 @@ class ProbeWorker(QThread):
                 return
 
             self.probed.emit(resolutions)
+
+            # 检测可用字幕语言（人工 + 自动），供 UI 选择
+            subs = extract_subtitle_languages(info)
+            self.subs_ready.emit(subs)
 
         except Exception as e:
             extra = "\n".join(probe_logger.errors) if probe_logger.errors else ""
