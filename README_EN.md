@@ -6,6 +6,8 @@ A YouTube video downloader with a GUI. Supports batch download, subtitle embeddi
 
 Built with PyQt6 + yt-dlp. Ships as a single-file Windows exe — just double-click.
 
+![Screenshot](docs/en.png)
+
 ## Features
 
 - **Batch download**: paste multiple URLs (one per line), download sequentially
