@@ -429,13 +429,19 @@ class DownloadWorker(QThread):
             })
         else:
             ydl_opts["merge_output_format"] = self.video_format
-            # 字幕：仅视频模式且指定语言时下载并嵌入（嵌入需 ffmpeg）
+            # 字幕：仅视频模式且指定语言时下载并嵌入（嵌入需 ffmpeg）。
+            # 注意 key 必须是 'FFmpegEmbedSubtitle'（带 FFmpeg 前缀），
+            # 写成 'EmbedSubtitle' 会触发 KeyError('EmbedSubtitlePP')。
+            # subtitlesformat=srt：YouTube 自动字幕默认 json3，需转成可嵌入的 srt。
             if self.subtitle_lang and has_ffmpeg:
                 ydl_opts.update({
                     "writesubtitles": True,
                     "writeautomaticsub": True,
                     "subtitleslangs": [self.subtitle_lang],
-                    "postprocessors": list(ydl_opts.get("postprocessors", [])) + [{"key": "EmbedSubtitle"}],
+                    "subtitlesformat": "srt",
+                    "postprocessors": list(ydl_opts.get("postprocessors", [])) + [
+                        {"key": "FFmpegEmbedSubtitle"},
+                    ],
                 })
 
         self._base_opts = ydl_opts
