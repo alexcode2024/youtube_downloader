@@ -21,13 +21,13 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QCheckBox, QFileDialog, QMessageBox, QFrame,
 )
 
+import i18n
+from i18n import tr
 from downloader import (
     DownloadWorker, ProbeWorker, normalize_youtube_url, subtitle_display_name,
 )
 
 
-# best 选项固定显示在最前，之后追加检测到的真实分辨率
-BEST_LABEL = "best (最高画质)"
 FORMAT_OPTIONS = ["mp4", "webm", "mkv"]
 
 
@@ -38,7 +38,7 @@ def _fmt_size(num_bytes):
     except (TypeError, ValueError):
         return "?"
     if n <= 0:
-        return "未知大小"
+        return "?"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024.0:
             if unit == "KB":
@@ -69,31 +69,14 @@ def _parse_urls(text):
 
 
 def _resource_path(relative_name):
-    """获取资源文件的绝对路径，兼容「源码运行」和「PyInstaller 打包后运行」。
-
-    源码运行：资源在脚本同目录（如 app.ico 与 app.py 同级）。
-    打包后：PyInstaller 解压到临时目录 sys._MEIPASS，资源在那里。
-    """
+    """获取资源文件的绝对路径，兼容「源码运行」和「PyInstaller 打包后运行」。"""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_name)
 
 
 def _bootstrap_stdio():
-    """
-    PyInstaller --windowed 模式下没有控制台，这会导致两类问题：
-
-    1. Python 层 sys.stdout/stderr 为 None → yt-dlp 等 print() 时抛
-       AttributeError（之前的「点下载闪退」根因）。
-
-    2. 【更隐蔽】OS 层文件句柄 (fd 1/2) 无效 → yt-dlp 调用的子进程
-       （node 执行 JS 签名脚本、ffmpeg 合并）继承到无效的 stdout/stderr，
-       子进程在写输出时 hang 住 → extract_info / download 永久卡住，
-       表现为「一直显示正在获取视频信息」。
-
-    本函数两层都做兜底：
-      - OS 层：把 fd 0/1/2 重定向到 NUL 设备，子进程继承到有效句柄
-      - Python 层：sys.stdout/stderr 设为 NullStream，print() 不报错
-    """
+    """PyInstaller --windowed 模式下兜底 stdout/stderr + OS 层文件句柄，
+    防止子进程（node/ffmpeg）因无效管道 hang 住。"""
     class _NullStream:
         def write(self, *a, **k):
             pass
@@ -101,7 +84,6 @@ def _bootstrap_stdio():
             pass
 
     is_windowed = sys.stdout is None or sys.stderr is None
-
     if is_windowed:
         try:
             nul = os.open(os.devnull, os.O_RDWR)
@@ -120,7 +102,7 @@ def _bootstrap_stdio():
 
 
 def _install_excepthook():
-    """全局异常钩子：未捕获异常写入 crash.log，避免「闪退且无任何线索」。"""
+    """全局异常钩子：未捕获异常写入 crash.log。"""
     def hook(exc_type, exc_value, exc_tb):
         try:
             log_path = os.path.join(os.path.expanduser("~"), "YouTubeDownloader_crash.log")
@@ -136,18 +118,22 @@ def _install_excepthook():
 class DownloaderWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.worker = None       # 当前后台下载线程
-        self.prober = None       # 当前后台检测线程
-        self._current_title = "" # 当前下载视频的标题（用于阶段提示拼接）
+        self.worker = None
+        self.prober = None
+        self._current_title = ""
         self._build_ui()
+        # 加载保存的语言，并注册语言切换回调
+        i18n.load_lang()
+        self._apply_lang_combo()
+        i18n.on_language_change(self._retranslate)
+        self._retranslate()
         self._refresh_controls()
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self):
-        self.setWindowTitle("YouTube 视频下载器")
-        self.setMinimumWidth(600)
-        self.setMinimumHeight(520)
-        self.resize(660, 580)
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(540)
+        self.resize(680, 600)
 
         icon_path = _resource_path("app.ico")
         if os.path.exists(icon_path):
@@ -157,30 +143,35 @@ class DownloaderWindow(QWidget):
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(14)
 
+        # ---- 标题行 + 语言选择 ----
+        top_row = QHBoxLayout()
         title_font = QFont()
         title_font.setPointSize(14)
         title_font.setBold(True)
-        title_label = QLabel("YouTube 视频下载器")
-        title_label.setFont(title_font)
-        root.addWidget(title_label)
+        self.title_label = QLabel()
+        self.title_label.setFont(title_font)
+        top_row.addWidget(self.title_label)
+        top_row.addStretch()
+        lang_label = QLabel("语言 / Language:")
+        top_row.addWidget(lang_label)
+        self.lang_combo = QComboBox()
+        for code, name in i18n.available_langs():
+            self.lang_combo.addItem(name, userData=code)
+        self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
+        top_row.addWidget(self.lang_combo)
+        root.addLayout(top_row)
 
         # ---- URL（多行，支持批量）+ 检测按钮 ----
-        url_label = QLabel("YouTube 链接（每行一个，支持批量）")
-        root.addWidget(url_label)
+        self.url_label = QLabel()
+        root.addWidget(self.url_label)
         url_row = QHBoxLayout()
         self.url_edit = QPlainTextEdit()
         self.url_edit.setMinimumHeight(58)
-        self.url_edit.setPlaceholderText(
-            "https://www.youtube.com/watch?v=...\nhttps://youtu.be/..."
-        )
-        # textChanged：内容变动即触发；改了链接则检测结果失效。
-        # 用 blockSignals 避免程序化清空时误触发。
         self.url_edit.textChanged.connect(self._on_url_edited)
         url_row.addWidget(self.url_edit, stretch=1)
-        # 检测/下载按钮竖排放在右侧
         url_btn_col = QVBoxLayout()
         url_btn_col.setSpacing(8)
-        self.probe_btn = QPushButton("检测分辨率")
+        self.probe_btn = QPushButton()
         self.probe_btn.setMinimumHeight(30)
         self.probe_btn.clicked.connect(self._on_probe)
         url_btn_col.addWidget(self.probe_btn)
@@ -190,9 +181,10 @@ class DownloaderWindow(QWidget):
 
         # ---- 类型选择（视频 / MP3）----
         type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("类型:"))
-        self.rb_video = QRadioButton("视频")
-        self.rb_audio = QRadioButton("仅音频 (MP3)")
+        self.type_label = QLabel()
+        type_row.addWidget(self.type_label)
+        self.rb_video = QRadioButton()
+        self.rb_audio = QRadioButton()
         self.rb_video.setChecked(True)
         self.type_group = QButtonGroup(self)
         self.type_group.addButton(self.rb_video)
@@ -210,40 +202,43 @@ class DownloaderWindow(QWidget):
         opt_form.setVerticalSpacing(10)
         self.quality_combo = QComboBox()
         self.quality_combo.setMinimumHeight(30)
-        self.quality_combo.setEnabled(False)  # 初始：未检测，禁用
-        opt_form.addRow("画质:", self.quality_combo)
+        self.quality_combo.setEnabled(False)
+        self._quality_label = QLabel()
+        opt_form.addRow(self._quality_label, self.quality_combo)
 
         self.format_combo = QComboBox()
         self.format_combo.setMinimumHeight(30)
         self.format_combo.addItems(FORMAT_OPTIONS)
         self.format_combo.setCurrentText("mp4")
-        opt_form.addRow("格式:", self.format_combo)
+        self._format_label = QLabel()
+        opt_form.addRow(self._format_label, self.format_combo)
 
-        # 字幕：复选框 + 语言下拉（视频模式、检测后启用）
+        # 字幕
         sub_row = QHBoxLayout()
-        self.sub_check = QCheckBox("嵌入字幕")
+        self.sub_check = QCheckBox()
         self.sub_check.toggled.connect(self._refresh_controls)
         self.sub_combo = QComboBox()
         self.sub_combo.setMinimumHeight(30)
         self.sub_combo.setEnabled(False)
-        self.sub_combo.addItem("（未检测到字幕）", userData=None)
+        self._reset_sub_combo()
         sub_row.addWidget(self.sub_check)
         sub_row.addWidget(self.sub_combo, stretch=1)
-        opt_form.addRow("字幕:", sub_row)
+        self._sub_label = QLabel()
+        opt_form.addRow(self._sub_label, sub_row)
         root.addLayout(opt_form)
 
         # ---- 保存位置 ----
         save_row = QHBoxLayout()
-        save_row.addWidget(QLabel("保存位置:"))
+        self.save_label = QLabel()
+        save_row.addWidget(self.save_label)
         self.save_edit = QLineEdit()
         self.save_edit.setMinimumHeight(30)
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
         if not os.path.isdir(default_dir):
             default_dir = os.path.expanduser("~")
         self.save_edit.setText(default_dir)
-        self.save_edit.setPlaceholderText("选择保存目录")
         save_row.addWidget(self.save_edit, stretch=1)
-        self.browse_btn = QPushButton("浏览…")
+        self.browse_btn = QPushButton()
         self.browse_btn.setMinimumHeight(30)
         self.browse_btn.clicked.connect(self._on_browse)
         save_row.addWidget(self.browse_btn)
@@ -262,7 +257,7 @@ class DownloaderWindow(QWidget):
         self.progress_bar.setFormat("%p%")
         root.addWidget(self.progress_bar)
 
-        self.stats_label = QLabel("准备就绪")
+        self.stats_label = QLabel()
         self.stats_label.setMinimumHeight(20)
         self.stats_label.setStyleSheet("color: #666;")
         root.addWidget(self.stats_label)
@@ -276,7 +271,7 @@ class DownloaderWindow(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self.action_btn = QPushButton("开始下载")
+        self.action_btn = QPushButton()
         self.action_btn.setMinimumWidth(140)
         self.action_btn.setMinimumHeight(34)
         self.action_btn.clicked.connect(self._on_action)
@@ -285,12 +280,59 @@ class DownloaderWindow(QWidget):
 
         root.addStretch()
 
+    def _apply_lang_combo(self):
+        """让语言下拉框显示当前语言（不触发回调）。"""
+        self.lang_combo.blockSignals(True)
+        cur = i18n.current_lang()
+        for i in range(self.lang_combo.count()):
+            if self.lang_combo.itemData(i) == cur:
+                self.lang_combo.setCurrentIndex(i)
+                break
+        self.lang_combo.blockSignals(False)
+
+    def _reset_sub_combo(self):
+        """重置字幕下拉为「未检测」占位项。"""
+        self.sub_combo.blockSignals(True)
+        self.sub_combo.clear()
+        self.sub_combo.addItem(tr("sub_none"), userData=None)
+        self.sub_combo.blockSignals(False)
+
+    # ----------------------------------------------------------- 多语言
+    def _on_lang_changed(self):
+        code = self.lang_combo.currentData()
+        if code:
+            i18n.set_language(code)  # 会触发 _retranslate
+
+    def _retranslate(self):
+        """语言切换后，重新设置所有控件文本。"""
+        self.setWindowTitle(tr("app_title"))
+        self.title_label.setText(tr("app_title"))
+        self.url_label.setText(tr("url_label"))
+        self.url_edit.setPlaceholderText(tr("url_placeholder"))
+        self.probe_btn.setText(tr("probe_btn"))
+        self.type_label.setText(tr("type_label"))
+        self.rb_video.setText(tr("type_video"))
+        self.rb_audio.setText(tr("type_audio"))
+        self._quality_label.setText(tr("quality_label"))
+        self._format_label.setText(tr("format_label"))
+        self._sub_label.setText(tr("subtitle_label"))
+        self.sub_check.setText(tr("sub_embed"))
+        # 字幕占位项的文本也要更新
+        if self.sub_combo.itemData(0) is None:
+            self.sub_combo.setItemText(0, tr("sub_none"))
+        self.save_label.setText(tr("save_label"))
+        self.save_edit.setPlaceholderText(tr("save_placeholder"))
+        self.browse_btn.setText(tr("browse_btn"))
+        # best 选项的显示文本（第 0 项）
+        if self.quality_combo.count() > 0 and self.quality_combo.itemData(0) == "best":
+            self.quality_combo.setItemText(0, tr("best_label"))
+        # 按钮文案（下载中不变，空闲时刷新）
+        if self.worker is None and self.prober is None:
+            self.action_btn.setText(tr("download_btn"))
+        self._refresh_controls()
+
     # -------------------------------------------------------------- 状态
     def _refresh_controls(self):
-        """集中式状态刷新。规则：
-          - 下载中/检测中：输入禁用，下载按钮变「取消」。
-          - 视频模式：画质为空时禁用下载（需先检测）。
-          - MP3 模式：无需检测即可下载；字幕/画质/格式禁用。"""
         downloading = self.worker is not None
         probing = self.prober is not None
         is_audio = self.rb_audio.isChecked()
@@ -307,22 +349,20 @@ class DownloaderWindow(QWidget):
         self.quality_combo.setEnabled((not busy) and (not is_audio) and has_qualities)
         self.format_combo.setEnabled((not busy) and (not is_audio))
 
-        # 字幕：仅视频模式、非 busy、有可选语言时启用
         has_subs = self.sub_combo.count() > 0 and self.sub_combo.itemData(0) is not None
         sub_enabled = (not busy) and (not is_audio) and has_subs
         self.sub_check.setEnabled(sub_enabled)
         self.sub_combo.setEnabled(sub_enabled and self.sub_check.isChecked())
-        # MP3 模式或无字幕时取消勾选
         if (is_audio or not has_subs) and self.sub_check.isChecked():
             self.sub_check.blockSignals(True)
             self.sub_check.setChecked(False)
             self.sub_check.blockSignals(False)
 
         if downloading:
-            self.action_btn.setText("取消")
+            self.action_btn.setText(tr("cancel"))
             self.action_btn.setEnabled(True)
         else:
-            self.action_btn.setText("开始下载")
+            self.action_btn.setText(tr("download_btn"))
             if is_audio:
                 self.action_btn.setEnabled(not probing)
             else:
@@ -330,50 +370,41 @@ class DownloaderWindow(QWidget):
 
     # -------------------------------------------------------------- 交互
     def _on_url_edited(self):
-        """链接被改动 → 之前的检测失效，清空画质与字幕下拉。"""
         self.quality_combo.clear()
-        # 清空字幕（恢复初始提示项）
-        self.sub_combo.blockSignals(True)
-        self.sub_combo.clear()
-        self.sub_combo.addItem("（未检测到字幕）", userData=None)
-        self.sub_combo.blockSignals(False)
+        self._reset_sub_combo()
         self.sub_check.blockSignals(True)
         self.sub_check.setChecked(False)
         self.sub_check.blockSignals(False)
         self.status_label.setText("")
         self.progress_bar.setValue(0)
-        self.stats_label.setText("准备就绪")
+        self.stats_label.setText(tr("ready"))
         self._refresh_controls()
 
     def _on_type_changed(self):
-        """类型切换：清掉进度状态，刷新控件。"""
         self.progress_bar.setValue(0)
-        self.stats_label.setText("准备就绪" if not self.prober else "正在检测可用分辨率…")
+        self.stats_label.setText(tr("ready") if not self.prober else tr("detecting"))
         self._refresh_controls()
 
     def _on_browse(self):
         current = self.save_edit.text().strip()
         start_dir = current if current and os.path.isdir(current) else ""
-        chosen = QFileDialog.getExistingDirectory(self, "选择保存位置", start_dir)
+        chosen = QFileDialog.getExistingDirectory(self, tr("choose_dir"), start_dir)
         if chosen:
             self.save_edit.setText(chosen)
 
     # -------------------------------------------------------- 检测分辨率
     def _on_probe(self):
-        """检测按钮：用第一个有效 URL 发起 ProbeWorker（批量时画质统一，检测一次即可）。"""
         valid, invalid = _parse_urls(self.url_edit.toPlainText())
         if not valid:
-            QMessageBox.warning(self, "提示", "请输入有效的 YouTube 链接（每行一个）。")
+            QMessageBox.warning(self, tr("tip"), tr("enter_url"))
             return
 
         self.quality_combo.clear()
-        self.sub_combo.clear()
-        self.sub_combo.addItem("（未检测到字幕）", userData=None)
+        self._reset_sub_combo()
         self.sub_check.setChecked(False)
-        self.stats_label.setText(f"正在检测可用分辨率…（第 1 个链接）")
+        self.stats_label.setText(tr("detected_first"))
         self.status_label.setText("")
 
-        # 检测用第一个 URL
         self.prober = ProbeWorker(url=valid[0])
         self.prober.info_ready.connect(self._on_probe_info)
         self.prober.probed.connect(self._on_probed)
@@ -384,39 +415,35 @@ class DownloaderWindow(QWidget):
         self._refresh_controls()
 
     def _on_probe_info(self, title):
-        self.status_label.setText(f"已找到: {title}")
+        self.status_label.setText(tr("found", title=title))
 
     def _on_probed(self, resolutions):
-        """检测成功：填充画质下拉框（best 在前），默认选 best。"""
         self.quality_combo.clear()
-        self.quality_combo.addItem(BEST_LABEL, userData="best")
+        self.quality_combo.addItem(tr("best_label"), userData="best")
         for res_name, size_bytes in resolutions:
             display = f"{res_name} ({_fmt_size(size_bytes)})"
             self.quality_combo.addItem(display, userData=res_name)
         self.quality_combo.setCurrentIndex(0)
-        n = len(resolutions)
-        self.stats_label.setText(f"检测到 {n} 种分辨率，请选择画质。")
+        self.stats_label.setText(tr("detected_n", n=len(resolutions)))
         self._refresh_controls()
 
     def _on_subs_ready(self, langs):
-        """字幕检测完成：填充字幕语言下拉框。无字幕时保持禁用提示。"""
         self.sub_combo.blockSignals(True)
         self.sub_combo.clear()
         if langs:
             for lang in langs:
                 self.sub_combo.addItem(subtitle_display_name(lang), userData=lang)
-            # 默认选第一个（通常是简体中文/英语）
             self.sub_combo.setCurrentIndex(0)
         else:
-            self.sub_combo.addItem("（未检测到字幕）", userData=None)
+            self.sub_combo.addItem(tr("sub_none"), userData=None)
         self.sub_combo.blockSignals(False)
         self._refresh_controls()
 
     def _on_probe_failed(self, msg):
         self.quality_combo.clear()
-        self.stats_label.setText("检测失败")
+        self.stats_label.setText(tr("detect_failed"))
         self.status_label.setText(msg)
-        QMessageBox.critical(self, "检测失败", msg)
+        QMessageBox.critical(self, tr("detect_failed"), msg)
         self._refresh_controls()
 
     def _on_probe_thread_finished(self):
@@ -425,60 +452,53 @@ class DownloaderWindow(QWidget):
 
     # ------------------------------------------------------------- 下载
     def _on_action(self):
-        """下载 / 取消 按钮的统一入口。"""
         if self.worker is not None:
             self._cancel_download()
             return
 
-        # ---- 解析多行 URL ----
         valid, invalid = _parse_urls(self.url_edit.toPlainText())
         if not valid:
-            QMessageBox.warning(self, "提示", "请输入有效的 YouTube 链接（每行一个）。")
+            QMessageBox.warning(self, tr("tip"), tr("enter_url"))
             return
 
         audio_only = self.rb_audio.isChecked()
-
-        # 视频模式：必须有选中的画质（已检测）
         if not audio_only and self.quality_combo.count() == 0:
-            QMessageBox.warning(self, "提示", "请先点击「检测分辨率」选择画质。")
+            QMessageBox.warning(self, tr("tip"), tr("detect_first"))
             return
 
         save_dir = self.save_edit.text().strip()
         if not save_dir:
-            QMessageBox.warning(self, "提示", "请选择保存位置。")
+            QMessageBox.warning(self, tr("tip"), tr("choose_save"))
             return
         if not os.path.isdir(save_dir):
-            ret = QMessageBox.question(self, "提示", f"目录不存在，是否创建？\n{save_dir}")
+            ret = QMessageBox.question(self, tr("tip"), tr("mkdir_ask", dir=save_dir))
             if ret != QMessageBox.StandardButton.Yes:
                 return
             try:
                 os.makedirs(save_dir, exist_ok=True)
             except OSError as e:
-                QMessageBox.critical(self, "错误", f"无法创建目录：\n{e}")
+                QMessageBox.critical(self, tr("error"), tr("mkdir_fail", err=str(e)))
                 return
 
         quality = self.quality_combo.currentData() or "best"
         video_format = self.format_combo.currentText()
 
-        # 字幕：视频模式且勾选且有有效语言时启用
         subtitle_lang = None
         if (not audio_only) and self.sub_check.isChecked() and self.sub_combo.isEnabled():
             subtitle_lang = self.sub_combo.currentData()
 
-        # 批量提示：多于 1 个时确认
         if len(valid) > 1:
-            extra = f"\n\n无效行 {len(invalid)} 个已忽略。" if invalid else ""
+            extra = tr("ignored", n=len(invalid)) if invalid else ""
             ret = QMessageBox.question(
-                self, "确认批量下载",
-                f"共 {len(valid)} 个有效链接，将依次下载（统一画质：{quality}）。\n{extra}"
+                self, tr("confirm_batch_title"),
+                tr("confirm_batch", n=len(valid), q=quality, extra=extra)
             )
             if ret != QMessageBox.StandardButton.Yes:
                 return
 
-        # ---- 启动下载 ----
         self.progress_bar.setValue(0)
-        self.stats_label.setText("正在获取视频信息…" if len(valid) == 1
-                                 else f"准备下载 {len(valid)} 个视频…")
+        self.stats_label.setText(tr("getting_info") if len(valid) == 1
+                                 else tr("prepare_batch", n=len(valid)))
         self.status_label.setText("")
         self._current_title = ""
 
@@ -501,7 +521,7 @@ class DownloaderWindow(QWidget):
 
     def _cancel_download(self):
         if self.worker is not None:
-            self.stats_label.setText("正在取消…")
+            self.stats_label.setText(tr("cancelling"))
             self.action_btn.setEnabled(False)
             self.worker.cancel()
 
@@ -522,14 +542,14 @@ class DownloaderWindow(QWidget):
 
     def _on_finished(self, msg):
         self.progress_bar.setValue(100)
-        self.stats_label.setText("下载完成！")
+        self.stats_label.setText(tr("done"))
         self.status_label.setText(msg)
-        QMessageBox.information(self, "完成", msg)
+        QMessageBox.information(self, tr("complete"), msg)
 
     def _on_failed(self, msg):
-        self.stats_label.setText("下载失败")
+        self.stats_label.setText(tr("failed"))
         self.status_label.setText(msg)
-        QMessageBox.critical(self, "下载失败", msg)
+        QMessageBox.critical(self, tr("failed"), msg)
 
     def _on_thread_finished(self):
         self.worker = None
@@ -537,8 +557,8 @@ class DownloaderWindow(QWidget):
 
 
 def main():
-    _bootstrap_stdio()      # 兜底 stdout/stderr，防止 windowed 模式闪退
-    _install_excepthook()   # 全局异常写日志
+    _bootstrap_stdio()
+    _install_excepthook()
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

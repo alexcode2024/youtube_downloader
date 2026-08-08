@@ -11,6 +11,8 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from i18n import tr
+
 
 def normalize_youtube_url(url):
     """
@@ -300,9 +302,9 @@ class DownloadWorker(QThread):
                         if self._current_file_idx < len(self._stream_kinds)
                         else "")
                 if kind == "video":
-                    self.stage.emit("正在下载视频流")
+                    self.stage.emit(tr("stage_video"))
                 elif kind == "audio":
-                    self.stage.emit("正在下载音频流")
+                    self.stage.emit(tr("stage_audio"))
 
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0)
@@ -336,13 +338,13 @@ class DownloadWorker(QThread):
             return
         pp_name = (d.get("postprocessor") or "").lower()
         if "merge" in pp_name or "ffmpegvideo" in pp_name:
-            self.stage.emit("正在合并视频和音频")
+            self.stage.emit(tr("stage_merge"))
             self.progress.emit(99, "", "", "")
         elif "extractaudio" in pp_name:
-            self.stage.emit("正在转换为 MP3")
+            self.stage.emit(tr("stage_mp3"))
             self.progress.emit(99, "", "", "")
         elif "embed" in pp_name:
-            self.stage.emit("正在写入元数据")
+            self.stage.emit(tr("stage_meta"))
 
     def cancel(self):
         self._cancelled = True
@@ -364,31 +366,27 @@ class DownloadWorker(QThread):
                     _tb.print_exc(file=f)
             except Exception:
                 pass
-            self.failed.emit(f"发生错误: {e}")
+            self.failed.emit(tr("worker_err", err=str(e)))
 
     def _run_inner(self):
         try:
             import yt_dlp
         except ImportError:
-            self.failed.emit("未找到 yt-dlp，请先运行: pip install yt-dlp")
+            self.failed.emit(tr("no_ytdlp"))
             return
 
         if not self.urls:
-            self.failed.emit("没有可下载的链接。")
+            self.failed.emit(tr("no_urls"))
             return
 
         has_ffmpeg = ffmpeg_available()
         if self.audio_only and not has_ffmpeg:
-            self.failed.emit(
-                "下载 MP3 需要 ffmpeg，但系统未检测到 ffmpeg。\n\n"
-                "请安装 ffmpeg 并确保它在系统 PATH 中。\n"
-                "下载地址：https://ffmpeg.org/download.html"
-            )
+            self.failed.emit(tr("need_ffmpeg_mp3"))
             return
 
         format_string = build_format_string(self.quality, self.audio_only, has_ffmpeg)
         if not has_ffmpeg and not self.audio_only:
-            self.info_ready.emit("（未检测到 ffmpeg，已降级为单流下载，画质可能略低）")
+            self.info_ready.emit(tr("downgrade"))
 
         try:
             output_dir = os.path.normpath(os.path.expanduser(self.output_dir))
@@ -465,7 +463,7 @@ class DownloadWorker(QThread):
 
         # 汇总结果
         if self._cancelled or self.isInterruptionRequested():
-            self.failed.emit("已取消下载" + (f"（已完成 {ok_count}/{total}）" if ok_count else ""))
+            self.failed.emit(tr("cancelled_partial", done=ok_count, total=total) if ok_count else tr("cancelled"))
             return
         if ok_count == total:
             self.finished_ok.emit(self._final_filepath or self.output_dir)
@@ -482,7 +480,7 @@ class DownloadWorker(QThread):
         last_err = ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             if self._cancelled or self.isInterruptionRequested():
-                return False, "已取消"
+                return False, tr("cancelled")
 
             attempt_logger = _YDLLogger()
             attempt_opts = dict(self._base_opts)
@@ -529,12 +527,12 @@ class DownloadWorker(QThread):
                             pass
 
                     if self._cancelled or self.isInterruptionRequested():
-                        return False, "已取消"
+                        return False, tr("cancelled")
 
                     retcode = ydl.download([url])
 
                 if self._cancelled or self.isInterruptionRequested():
-                    return False, "已取消"
+                    return False, tr("cancelled")
 
                 if retcode == 0 and not attempt_logger.errors:
                     return True, ""
@@ -542,10 +540,10 @@ class DownloadWorker(QThread):
                 last_err = "\n".join(attempt_logger.errors) if attempt_logger.errors else f"错误码 {retcode}"
 
             except _DownloadCancelled:
-                return False, "已取消"
+                return False, tr("cancelled")
             except Exception as e:
                 if self._cancelled:
-                    return False, "已取消"
+                    return False, tr("cancelled")
                 last_err = str(e)
                 retcode = 1
                 extra = "\n".join(attempt_logger.errors) if attempt_logger.errors else ""
@@ -553,10 +551,10 @@ class DownloadWorker(QThread):
                     last_err = f"{e}\n{extra}"
 
             if self._cancelled or self.isInterruptionRequested():
-                return False, "已取消"
+                return False, tr("cancelled")
 
             if attempt < MAX_ATTEMPTS:
-                self.info_ready.emit(f"{prefix}网络异常，正在重试（第 {attempt + 1}/{MAX_ATTEMPTS} 次）…")
+                self.info_ready.emit(tr("retry_one", prefix=prefix, n=attempt + 1, max=MAX_ATTEMPTS))
 
         return False, f"重试 {MAX_ATTEMPTS} 次仍失败：{last_err[:120]}"
 def _extract_resolutions(info):
@@ -722,7 +720,7 @@ class ProbeWorker(QThread):
 
             resolutions = _extract_resolutions(info)
             if not resolutions:
-                self.failed.emit("未检测到可用分辨率。")
+                self.failed.emit(tr("no_res"))
                 return
 
             self.probed.emit(resolutions)
